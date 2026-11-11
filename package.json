@@ -27,6 +27,7 @@
     "access": "public"
   },
   "scripts": {
+    "prepare": "git config core.hooksPath .githooks",
     "build": "tsc -p tsconfig.build.json",
     "test": "tsx --test tests/*.test.ts",
     "check": "tsc -p tsconfig.json",
