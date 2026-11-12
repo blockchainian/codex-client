@@ -1,6 +1,6 @@
 {
   "name": "@blockchainian/codex-client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A typed HTTP/2 Codex Responses client backed by a ChatGPT file login.",
   "type": "module",
   "exports": {
@@ -47,5 +47,9 @@
     "eslint-plugin-jsdoc": "65.4.5",
     "eslint-plugin-unicorn": "62.0.0",
     "typescript-eslint": "8.72.2"
+  },
+  "dependencies": {
+    "openai": "^7.55.0",
+    "@types/ws": "^8.18.2"
   }
 }

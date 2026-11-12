@@ -1,10 +1,9 @@
 import type { ApiError, FailureDetails } from './errors.js';
 import { isQuotaError, retryableError, usageLimitError } from './errors.js';
-import type { ApiUsage, StreamMetrics, Usage } from './metrics.js';
+import type { ApiUsage, Usage } from './metrics.js';
 import { usageOf } from './metrics.js';
 import type { RespondRequest } from './types.js';
 
-const MAX_EVENT_BYTES = 2_000_000;
 const FAILURE_EVENTS = new Set(['error', 'response.failed', 'response.incomplete']);
 
 /** A streaming Responses request; `undefined` fields are left out of the JSON. */
@@ -21,6 +20,8 @@ export interface RequestBody {
   stream: true;
   include: string[];
   service_tier?: string;
+  prompt_cache_key?: string;
+  prompt_cache_options?: RespondRequest['promptCacheOptions'];
   /* eslint-enable @typescript-eslint/naming-convention -- The snake_case fields end here. */
   text?: { verbosity?: string; format?: object };
 }
@@ -47,6 +48,8 @@ export function requestBody<T>(request: RespondRequest<T>): RequestBody {
     stream: true,
     include: lite ? ['reasoning.encrypted_content'] : [],
     service_tier: request.serviceTier,
+    prompt_cache_key: request.promptCacheKey,
+    prompt_cache_options: request.promptCacheOptions,
     /* eslint-enable @typescript-eslint/naming-convention -- The snake_case fields end here. */
     text: hasText ? { verbosity, format } : undefined,
   };
@@ -69,7 +72,8 @@ interface ApiResponse {
   output?: OutputItem[];
 }
 
-interface StreamEvent extends ApiError {
+/** A Responses event decoded by the SDK. */
+export interface StreamEvent extends ApiError {
   delta?: unknown;
   response?: ApiResponse;
   error?: ApiError;
@@ -88,16 +92,6 @@ export interface StreamResult {
 
 /** Reads a Responses event stream into its output text and usage. */
 export class ResponseStream {
-  readonly metrics: StreamMetrics = {
-    bytes: 0,
-    events: 0,
-    /* eslint-disable @typescript-eslint/naming-convention -- The Responses API uses snake_case fields. */
-    output_text_chars: 0,
-    first_event_at: null,
-    last_event_at: null,
-    last_event: null,
-    /* eslint-enable @typescript-eslint/naming-convention -- The snake_case fields end here. */
-  };
   usage: Usage | undefined = undefined;
   private completed = false;
   private output: OutputItem[] | undefined = undefined;
@@ -108,45 +102,21 @@ export class ResponseStream {
   /** @param allowIncomplete Accepts replies cut off by `max_output_tokens`. */
   constructor(private readonly allowIncomplete: boolean) {}
 
-  /** Consumes the body, splitting it into server-sent events. */
-  async read(body: AsyncIterable<Buffer>): Promise<StreamResult> {
-    const decoder = new TextDecoder();
-    let buffer = '';
-    for await (const chunk of body) {
-      this.metrics.bytes += chunk.length;
-      buffer += decoder.decode(chunk, { stream: true });
-      let boundary = /\r?\n\r?\n/.exec(buffer);
-      while (boundary) {
-        if (boundary.index > MAX_EVENT_BYTES) {
-          throw retryableError('Responses SSE event too large.');
-        }
-        this.handle(buffer.slice(0, boundary.index));
-        buffer = buffer.slice(boundary.index + boundary[0].length);
-        boundary = /\r?\n\r?\n/.exec(buffer);
-      }
-      if (buffer.length > MAX_EVENT_BYTES) {
-        throw retryableError('Responses SSE event too large.');
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim()) this.handle(buffer);
+  /** Consumes the events decoded by the OpenAI SDK. */
+  async read(events: AsyncIterable<StreamEvent>): Promise<StreamResult> {
+    for await (const event of events) this.handle(event);
     return this.result();
   }
 
-  private handle(block: string): void {
-    const data = block
-      .split(/\r?\n/)
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.slice(5).replace(/^ /, ''))
-      .join('\n');
-    if (!data || data === '[DONE]') return;
-    let event: StreamEvent;
-    try {
-      event = JSON.parse(data) as StreamEvent;
-    } catch {
-      throw retryableError('Invalid Responses SSE.');
+  private handle(event: StreamEvent): void {
+    if (
+      this.allowIncomplete &&
+      event.type === 'response.output_text.delta' &&
+      typeof event.delta === 'string'
+    ) {
+      this.deltas += event.delta;
     }
-    this.record(event);
+    if (event.response?.usage) this.usage = usageOf(event.response.usage);
     if (this.isFailure(event)) this.fail(event);
     if (event.type === 'response.output_item.done') {
       this.items.set(
@@ -161,22 +131,6 @@ export class ResponseStream {
       }
       this.finish(event);
     }
-  }
-
-  private record(event: StreamEvent): void {
-    const now = Date.now();
-    this.metrics.events++;
-    this.metrics.first_event_at ??= now;
-    this.metrics.last_event_at = now;
-    this.metrics.last_event = typeof event.type === 'string' ? event.type : null;
-    if (
-      event.type === 'response.output_text.delta' &&
-      typeof event.delta === 'string'
-    ) {
-      this.metrics.output_text_chars += event.delta.length;
-      if (this.allowIncomplete) this.deltas += event.delta;
-    }
-    if (event.response?.usage) this.usage = usageOf(event.response.usage);
   }
 
   private isFailure(event: StreamEvent): boolean {

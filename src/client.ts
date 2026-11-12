@@ -1,6 +1,11 @@
 import type { ClientHttp2Stream, OutgoingHttpHeaders } from 'node:http2';
 import { setTimeout as delay } from 'node:timers/promises';
 
+import OpenAi from 'openai';
+import type { APIError as SdkError } from 'openai';
+import { Stream } from 'openai/core/streaming';
+import type { ResponseCreateParamsStreaming } from 'openai/resources/responses/responses';
+
 import type { AuthFile, AuthStore, RefreshReason, TokenReply } from './auth.js';
 import { refreshReasonOf } from './auth.js';
 import type { ApiError } from './errors.js';
@@ -19,11 +24,12 @@ import {
   selectRateHeaders,
 } from './metrics.js';
 import { RateLimitPauses } from './pauses.js';
-import type { RequestBody, StreamResult } from './responses.js';
+import { Batches } from './batches.js';
+import type { RequestBody, StreamEvent, StreamResult } from './responses.js';
 import { requestBody, ResponseStream } from './responses.js';
 import type { SecretSet } from './secrets.js';
 import type { HttpResponse, SessionPool } from './sessions.js';
-import { cancel } from './sessions.js';
+import { cancel, toResponse } from './sessions.js';
 import type {
   ClientOptions,
   CodexClient,
@@ -38,7 +44,8 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 /** The services and settings a client runs with. */
 export interface ClientServices {
-  options: Required<ClientOptions>;
+  options: Required<Omit<ClientOptions, 'auth' | 'apiKey'>>;
+  apiKey?: string;
   endpoint: string;
   secrets: SecretSet;
   auth: AuthStore;
@@ -85,6 +92,7 @@ function isEmpty(output: unknown): boolean {
 
 /** Queues model calls, sharing one login, connection pool and rate limit pause. */
 export class Client implements CodexClient {
+  readonly batches: Batches;
   private readonly queue: Array<() => Promise<void>> = [];
   private readonly drained: Array<() => void> = [];
   private readonly stopped = new AbortController();
@@ -95,6 +103,11 @@ export class Client implements CodexClient {
   private inFlight = 0;
 
   constructor(private readonly services: ClientServices) {
+    this.batches = new Batches(
+      services.apiKey,
+      services.options.baseUrl,
+      services.sessions,
+    );
     const { runId, event, rateLimitDelayMs } = services.options;
     this.pauses = new RateLimitPauses(
       runId,
@@ -127,12 +140,14 @@ export class Client implements CodexClient {
 
   async close(): Promise<void> {
     this.accepting = false;
+    const batchesClosed = this.batches.close();
     if (this.active > 0 || this.queue.length > 0) {
       await new Promise<void>((resolve) => {
         this.drained.push(resolve);
       });
     }
     this.pauses.end();
+    await batchesClosed;
     await this.services.sessions.close();
   }
 
@@ -200,8 +215,11 @@ export class Client implements CodexClient {
     state: CallState,
   ): Promise<RespondResult<T>> {
     const telemetry = request.telemetry ?? {};
-    let auth = await this.services.auth.read();
-    const reason = refreshReasonOf(auth);
+    let auth = this.services.apiKey
+      ? // eslint-disable-next-line @typescript-eslint/naming-convention -- The login-shaped credential uses native token fields.
+        { tokens: { access_token: this.services.apiKey, account_id: '' } }
+      : await this.services.auth.read();
+    const reason = this.services.apiKey ? undefined : refreshReasonOf(auth);
     if (reason) auth = await this.refresh(auth, reason, telemetry);
     for (;;) {
       await this.waitForRateLimit();
@@ -221,7 +239,7 @@ export class Client implements CodexClient {
       if (outcome === 'rate-limited') {
         state.previousFailure = 'HTTP_429';
       } else if (outcome === 'unauthorized') {
-        if (state.recoveredUnauthorized) throw authError();
+        if (this.services.apiKey || state.recoveredUnauthorized) throw authError();
         state.recoveredUnauthorized = true;
         state.previousFailure = 'HTTP_401';
         auth = await this.refresh(auth, 'unauthorized_recovery', telemetry);
@@ -252,45 +270,74 @@ export class Client implements CodexClient {
     auth: AuthFile,
     metrics: AttemptMetrics,
   ): Promise<ModelOutcome<T>> {
-    const headers: OutgoingHttpHeaders = {
+    const headers: Record<string, string> = {
       authorization: `Bearer ${auth.tokens.access_token}`,
       /* eslint-disable @typescript-eslint/naming-convention -- Request bodies, telemetry and attempt logs use snake_case fields. */
-      'chatgpt-account-id': auth.tokens.account_id,
       originator: 'codex_cli_rs',
       accept: 'text/event-stream',
       'user-agent': 'codex-responses-client',
       /* eslint-enable @typescript-eslint/naming-convention -- The snake_case fields end here. */
     };
+    if (!this.services.apiKey)
+      headers['chatgpt-account-id'] = auth.tokens.account_id;
     if (request.responsesLite) {
       headers['x-openai-internal-codex-responses-lite'] = 'true';
     }
     let response: HttpResponse | undefined;
     try {
-      response = await this.send(this.services.endpoint, body, metrics, headers);
-      if (response.status === 401) return 'unauthorized';
-      if (!response.ok) return await this.rejectStatus(response, metrics);
-      const streamed = await this.readStream(request, response.body, metrics);
+      const sdk = this.modelSdk(auth, metrics, (received) => {
+        response = received;
+      });
+      // The Codex endpoint accepts additional model efforts and input items.
+      const raw = await sdk.responses
+        .create(body as unknown as ResponseCreateParamsStreaming, { headers })
+        .asResponse();
+      const streamed = await this.readStream(request, raw, sdk, metrics);
       const output = await this.outputOf(request, streamed, metrics);
       return { output, usage: streamed.usage };
     } catch (error: unknown) {
+      if (error instanceof OpenAi.APIError && error.status !== undefined) {
+        if (error.status === 401) return 'unauthorized';
+        return this.rejectStatus(error, metrics);
+      }
       throw this.classify(error);
     } finally {
       if (response) cancel(response.body);
     }
   }
 
-  /** Throws for an error status, or reports a rate limit to wait out. */
-  private async rejectStatus(
-    response: HttpResponse,
+  private modelSdk(
+    auth: AuthFile,
     metrics: AttemptMetrics,
-  ): Promise<'rate-limited'> {
-    let error: ApiError | undefined;
-    try {
-      error = (JSON.parse(await readText(response.body)) as { error?: ApiError })
-        .error;
-    } catch {
-      // Only structured error codes identify quota errors.
-    }
+    received: (response: HttpResponse) => void,
+  ): OpenAi {
+    return new OpenAi({
+      apiKey: auth.tokens.access_token,
+      // eslint-disable-next-line @typescript-eslint/naming-convention -- The SDK option is named baseURL.
+      baseURL: this.services.endpoint.replace(/\/responses$/, ''),
+      maxRetries: 0,
+      // HTTP/2 enforces the idle timeout instead of a short total request timeout.
+      timeout: 2_147_483_647,
+      logLevel: 'off',
+      fetch: async (_url, init) => {
+        if (typeof init?.body !== 'string') {
+          throw new Error('Expected a JSON Responses request.');
+        }
+        const response = await this.send(
+          this.services.endpoint,
+          init.body,
+          metrics,
+          Object.fromEntries(new Headers(init.headers)),
+        );
+        received(response);
+        return toResponse(response);
+      },
+    });
+  }
+
+  /** Throws for an error status, or reports a rate limit to wait out. */
+  private rejectStatus(response: SdkError, metrics: AttemptMetrics): 'rate-limited' {
+    const error = response.error as ApiError | undefined;
     const details = {
       source: 'http',
       code: error?.code,
@@ -304,19 +351,26 @@ export class Client implements CodexClient {
       return 'rate-limited';
     }
     const message = `Responses HTTP ${response.status}.`;
-    if (response.status >= 500) throw retryableError(message, details);
+    if ((response.status ?? 0) >= 500) throw retryableError(message, details);
     throw new CodexError(message, { details });
   }
 
   private async readStream<T>(
     request: RespondRequest<T>,
-    body: ClientHttp2Stream,
+    raw: Response,
+    sdk: OpenAi,
     metrics: AttemptMetrics,
   ): Promise<StreamResult> {
+    const events = Stream.fromSSEResponse<StreamEvent>(
+      raw,
+      new AbortController(),
+      sdk,
+      false,
+      'events',
+    );
     const stream = new ResponseStream(request.recoverIncomplete !== undefined);
-    metrics.stream = stream.metrics;
     try {
-      return await stream.read(body);
+      return await stream.read(events);
     } finally {
       metrics.usage = stream.usage ?? null;
     }
@@ -356,7 +410,11 @@ export class Client implements CodexClient {
     if (error instanceof CodexError) {
       return error.code === 'USAGE_LIMIT' ? this.stop(error) : error;
     }
-    const cause = error as TransportError;
+    const cause = (
+      error instanceof OpenAi.APIConnectionError && error.cause instanceof Error
+        ? error.cause
+        : error
+    ) as TransportError;
     return retryableError(
       'Responses network or stream failure.',
       errorDetails('transport', cause),
@@ -402,15 +460,14 @@ export class Client implements CodexClient {
   /** Sends a JSON POST, recording its timing and response metadata. */
   private async send(
     url: string,
-    body: object,
+    body: object | string,
     metrics: AttemptMetrics,
     headers: OutgoingHttpHeaders = {},
   ): Promise<HttpResponse> {
     const { options, secrets, sessions } = this.services;
-    const payload = JSON.stringify(body);
+    const payload = typeof body === 'string' ? body : JSON.stringify(body);
     metrics.body_bytes = Buffer.byteLength(payload);
     const sent = sessions.post(new URL(url), payload, headers);
-    metrics.session_id = sent.sessionId;
     metrics.sent_at = Date.now();
     metrics.in_flight = ++this.inFlight;
     metrics.queued =
@@ -447,10 +504,6 @@ export class Client implements CodexClient {
       (value) => ({ value }),
       (error: unknown) => ({ error: this.annotate(error as CodexError, metrics) }),
     );
-    if (metrics.stream) {
-      metrics.stream.last_event =
-        this.services.secrets.redact(metrics.stream.last_event) ?? null;
-    }
     metrics.ended_at = Date.now();
     if (metrics.sent_at !== null) {
       metrics.duration_ms = metrics.ended_at - metrics.sent_at;

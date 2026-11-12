@@ -177,6 +177,8 @@ test('respond returns the streamed output and usage', async () => {
     },
     { log: (metrics) => logs.push(metrics) },
   );
+  assert.equal('session_id' in (logs[0] ?? {}), false);
+  assert.equal('stream' in (logs[0] ?? {}), false);
   assert.deepEqual(
     logs.map((metrics) => [metrics.kind, metrics.status, metrics.batch_id]),
     [['model', 200, 'b1']],
@@ -260,6 +262,70 @@ test('a usage limit stops the client', async () => {
     async (client) => {
       await assert.rejects(client.respond(call), { code: 'USAGE_LIMIT' });
       await assert.rejects(client.respond(call), { code: 'USAGE_LIMIT' });
+    },
+  );
+});
+
+test('respond retries server errors once per logged HTTP attempt', async () => {
+  await writeAuth('access-1');
+  const replies = [errorReply(503, 'server_error'), completion('Recovered.')];
+  const logs: AttemptMetrics[] = [];
+  await withClient(
+    () => replies.shift() ?? errorReply(500, 'unexpected'),
+    async (client, server) => {
+      assert.equal((await client.respond(call)).output, 'Recovered.');
+      assert.equal(server.requests.length, 2);
+    },
+    { log: (metrics) => logs.push(metrics) },
+  );
+  assert.deepEqual(
+    logs.map((metrics) => [metrics.attempt, metrics.status]),
+    [
+      [1, 503],
+      [2, 200],
+    ],
+  );
+});
+
+test('respond treats a streamed quota error as terminal', async () => {
+  await writeAuth('access-1');
+  const body = `event: error\ndata: ${JSON.stringify({
+    type: 'error',
+    code: 'usage_limit_reached',
+    message: 'Quota exhausted.',
+  })}\n\n`;
+  await withClient(
+    () => ({ status: 200, body }),
+    async (client, server) => {
+      await assert.rejects(client.respond(call), { code: 'USAGE_LIMIT' });
+      await assert.rejects(client.respond(call), { code: 'USAGE_LIMIT' });
+      assert.equal(server.requests.length, 1);
+    },
+  );
+});
+
+test('respond recovers incomplete streamed output and validates it', async () => {
+  await writeAuth('access-1');
+  const reply = completion('Partial.');
+  const body = reply.body
+    .replaceAll('response.completed', 'response.incomplete')
+    .replace(
+      '"status":"completed"',
+      '"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}',
+    );
+  await withClient(
+    () => ({ ...reply, body }),
+    async (client, server) => {
+      const result = await client.respond({
+        ...call,
+        recoverIncomplete: (text) => text,
+        validate: (output, context) => {
+          assert.equal(output, 'Partial.');
+          assert.equal(context?.incomplete, true);
+        },
+      });
+      assert.equal(result.output, 'Partial.');
+      assert.equal(server.requests.length, 1);
     },
   );
 });

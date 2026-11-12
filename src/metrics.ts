@@ -12,18 +12,6 @@ export interface Usage {
   /* eslint-enable @typescript-eslint/naming-convention -- The snake_case fields end here. */
 }
 
-/** Progress of one server-sent event stream. */
-export interface StreamMetrics {
-  bytes: number;
-  events: number;
-  /* eslint-disable @typescript-eslint/naming-convention -- Attempt logs and usage are a published snake_case contract. */
-  output_text_chars: number;
-  first_event_at: number | null;
-  last_event_at: number | null;
-  last_event: string | null;
-  /* eslint-enable @typescript-eslint/naming-convention -- The snake_case fields end here. */
-}
-
 /** Metrics of one HTTP attempt, passed to the `log` option when it ends. */
 export interface AttemptMetrics {
   kind: 'model' | 'refresh';
@@ -41,7 +29,6 @@ export interface AttemptMetrics {
   ended_at: number | null;
   attempt: number;
   previous_failure: string | null;
-  session_id: number | null;
   body_bytes: number;
   in_flight: number;
   queued: number;
@@ -52,7 +39,6 @@ export interface AttemptMetrics {
   failure: Failure | null;
   request_id: string | null;
   /* eslint-enable @typescript-eslint/naming-convention -- The snake_case fields end here. */
-  stream: StreamMetrics | null;
 }
 
 /** Identifies one HTTP attempt within a call. */
@@ -84,7 +70,6 @@ export function createMetrics(
     ended_at: null,
     attempt: context.attempt ?? 1,
     previous_failure: context.previous_failure ?? null,
-    session_id: null,
     body_bytes: 0,
     in_flight: 0,
     queued: 0,
@@ -95,7 +80,6 @@ export function createMetrics(
     failure: null,
     request_id: null,
     /* eslint-enable @typescript-eslint/naming-convention -- The snake_case fields end here. */
-    stream: null,
   };
 }
 

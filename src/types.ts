@@ -1,4 +1,5 @@
 import type { AttemptMetrics, Usage } from './metrics.js';
+import type { ClientBatches } from './batches.js';
 
 /** Safe identifiers of the calling batch, copied into attempt logs. */
 export interface Telemetry {
@@ -28,6 +29,9 @@ export interface ValidationContext {
 /** One model call. */
 export interface RespondRequest<T = string> {
   model: string;
+  /** Stable routing key shared by warm-up and batch requests. */
+  promptCacheKey?: string;
+  promptCacheOptions?: { mode: 'implicit' | 'explicit'; ttl: '30m' | '12h' };
   effort: string;
   /** Omit when developer input messages already carry the instructions. */
   instructions?: string;
@@ -66,8 +70,15 @@ export interface PauseEvent {
   /* eslint-enable @typescript-eslint/naming-convention -- The snake_case fields end here. */
 }
 
+/** Selects account credentials or an explicitly paid API credential. */
+export type Authentication =
+  { type: 'account' } | { type: 'api-key'; apiKey?: string };
+
 /** Options of `createCodexClient`. */
 export interface ClientOptions {
+  auth?: Authentication;
+  /** API-key shorthand, mutually exclusive with auth. */
+  apiKey?: string;
   /** The maximum number of calls in progress; defaults to 20. */
   concurrency?: number;
   /** The directory holding `auth.json`; defaults to `CODEX_HOME` or `~/.codex`. */
@@ -91,6 +102,7 @@ export interface ClientOptions {
 
 /** A Codex Responses client. */
 export interface CodexClient {
+  readonly batches: ClientBatches;
   /** Queues a model call and resolves with its output. */
   respond<T = string>(request: RespondRequest<T>): Promise<RespondResult<T>>;
   /** Waits for accepted calls, refuses further calls and closes connections. */

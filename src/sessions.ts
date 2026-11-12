@@ -22,7 +22,6 @@ export interface HttpResponse {
 
 /** A POST request handed to an HTTP/2 session. */
 export interface SentRequest {
-  sessionId: number;
   response: Promise<HttpResponse>;
 }
 
@@ -35,25 +34,103 @@ export function cancel(body: ClientHttp2Stream): void {
   body.resume();
 }
 
+function responseHeaders(response: HttpResponse): Headers {
+  const excluded = new Set([
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+  ]);
+  const connection = response.headers.connection;
+  if (connection) {
+    for (const name of connection.split(',')) {
+      excluded.add(name.trim().toLowerCase());
+    }
+  }
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(response.headers)) {
+    if (name.startsWith(':') || excluded.has(name) || value === undefined) {
+      continue;
+    }
+    for (const item of Array.isArray(value) ? value : [String(value)]) {
+      headers.append(name, item);
+    }
+  }
+  return headers;
+}
+
+function responseBody(response: HttpResponse): ReadableStream<Uint8Array> {
+  let active = true;
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      response.body.on('data', (chunk: Buffer) => {
+        if (!active) return;
+        controller.enqueue(chunk);
+        if ((controller.desiredSize ?? 0) <= 0) response.body.pause();
+      });
+      response.body.once('end', () => {
+        if (active) controller.close();
+        active = false;
+      });
+      response.body.once('error', (error: Error) => {
+        if (active) controller.error(error);
+        active = false;
+      });
+    },
+    pull() {
+      response.body.resume();
+    },
+    cancel() {
+      active = false;
+      cancel(response.body);
+    },
+  });
+}
+
+/** Converts an HTTP/2 response into the Web Response consumed by the SDK. */
+export function toResponse(response: HttpResponse): Response {
+  return new Response(responseBody(response), {
+    status: response.status,
+    headers: responseHeaders(response),
+  });
+}
+
 /** Keeps one HTTP/2 session per origin, replacing sessions that end. */
 export class SessionPool {
   private readonly current = new Map<string, ClientHttp2Session>();
   private readonly open = new Set<ClientHttp2Session>();
-  private readonly ids = new WeakMap<ClientHttp2Session, number>();
-  private created = 0;
 
   constructor(private readonly timeoutMs: number) {}
 
   /** Sends a JSON body, failing when the stream stays silent for the timeout. */
   post(url: URL, payload: string, headers: OutgoingHttpHeaders): SentRequest {
-    const session = this.sessionFor(url.origin);
-    const stream = session.request({
-      [constants.HTTP2_HEADER_METHOD]: 'POST',
-      [constants.HTTP2_HEADER_PATH]: url.pathname + url.search,
+    return this.request('POST', url, payload, {
       [constants.HTTP2_HEADER_CONTENT_TYPE]: 'application/json',
       ...headers,
-      [sensitiveHeaders]: ['authorization', 'chatgpt-account-id'],
     });
+  }
+
+  /** Sends an SDK request, including multipart uploads, over HTTP/2. */
+  request(
+    method: string,
+    url: URL,
+    payload: string | Buffer,
+    headers: OutgoingHttpHeaders,
+  ): SentRequest {
+    const session = this.sessionFor(url.origin);
+    const stream = session.request(
+      {
+        [constants.HTTP2_HEADER_METHOD]: method,
+        [constants.HTTP2_HEADER_PATH]: url.pathname + url.search,
+        ...headers,
+        [sensitiveHeaders]: ['authorization', 'chatgpt-account-id'],
+      },
+      { endStream: false },
+    );
     // Long outputs that keep streaming may run past the timeout.
     stream.setTimeout(this.timeoutMs, () => {
       const error: TransportError = new Error('Request timed out.');
@@ -75,7 +152,7 @@ export class SessionPool {
       });
     });
     stream.end(payload);
-    return { sessionId: this.ids.get(session) ?? 0, response };
+    return { response };
   }
 
   /** Closes every open session. */
@@ -96,7 +173,6 @@ export class SessionPool {
     const existing = this.current.get(origin);
     if (existing && !existing.closed && !existing.destroyed) return existing;
     const session = connect(origin);
-    this.ids.set(session, ++this.created);
     this.current.set(origin, session);
     this.open.add(session);
     const forget = () => {
