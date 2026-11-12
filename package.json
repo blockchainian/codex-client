@@ -1,6 +1,6 @@
 {
   "name": "@blockchainian/codex-client",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A typed HTTP/2 Codex Responses client backed by a ChatGPT file login.",
   "type": "module",
   "exports": {

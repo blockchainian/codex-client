@@ -273,13 +273,14 @@ export class Client implements CodexClient {
     const headers: Record<string, string> = {
       authorization: `Bearer ${auth.tokens.access_token}`,
       /* eslint-disable @typescript-eslint/naming-convention -- Request bodies, telemetry and attempt logs use snake_case fields. */
-      originator: 'codex_cli_rs',
       accept: 'text/event-stream',
       'user-agent': 'codex-responses-client',
       /* eslint-enable @typescript-eslint/naming-convention -- The snake_case fields end here. */
     };
-    if (!this.services.apiKey)
+    if (!this.services.apiKey) {
+      headers.originator = 'codex_cli_rs';
       headers['chatgpt-account-id'] = auth.tokens.account_id;
+    }
     if (request.responsesLite) {
       headers['x-openai-internal-codex-responses-lite'] = 'true';
     }
